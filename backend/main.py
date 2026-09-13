@@ -1,7 +1,7 @@
 import os
 import uuid
 import json
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import pytesseract
@@ -12,6 +12,9 @@ import google.generativeai as genai
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 model = genai.GenerativeModel("gemini-3.6-flash")
+
+MAX_UPLOAD_MB = 10
+ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
 
 app = FastAPI()
 
@@ -150,13 +153,13 @@ def process_document(job_id: str, file_path: str):
 
         results = [ask_gemini(c) for c in chunks]
 
-        merged = {"line_items": [], "total": None, "flags": [],
+        merged = {"line_items": [], "total": None, "totals_found": [], "flags": [],
                   "health_summary": {"diagnosis": "", "explanation": "", "next_steps": []}}
         for r in results:
             merged["line_items"].extend(r.get("line_items", []))
             merged["flags"].extend(r.get("flags", []))
             if r.get("total"):
-                merged["total"] = r["total"]
+                merged["totals_found"].append(str(r["total"]))
 
             hs = r.get("health_summary", {})
             if hs.get("diagnosis"):
@@ -169,6 +172,17 @@ def process_document(job_id: str, file_path: str):
                 )
             merged["health_summary"]["next_steps"].extend(hs.get("next_steps", []))
 
+        
+        if merged["totals_found"]:
+            merged["total"] = merged["totals_found"][-1]
+            distinct = set(merged["totals_found"])
+            if len(distinct) > 1:
+                merged["flags"].append(
+                    "Different total amounts were found in different parts of the document: "
+                    + ", ".join(sorted(distinct)) + " — please double-check the final total."
+                )
+        merged.pop("totals_found", None)
+
         jobs[job_id]["status"] = "completed"
         jobs[job_id]["result"] = merged
 
@@ -176,16 +190,40 @@ def process_document(job_id: str, file_path: str):
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = str(e)
 
+    finally:
+        # Privacy: never keep an uploaded medical document on disk longer than
+        # it takes to extract text from it.
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+
 
 @app.post("/upload")
 async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Only PDF, JPG, JPEG, or PNG files are accepted")
+
     job_id = str(uuid.uuid4())
-    save_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    safe_name = os.path.basename(file.filename or "document")
+    save_path = os.path.join(UPLOAD_DIR, f"{job_id}_{safe_name}")
 
+    limit_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    size = 0
     with open(save_path, "wb") as f:
-        f.write(await file.read())
+        while True:
+            piece = await file.read(1024 * 1024)
+            if not piece:
+                break
+            size += len(piece)
+            if size > limit_bytes:
+                f.close()
+                os.remove(save_path)
+                raise HTTPException(status_code=413, detail=f"File exceeds {MAX_UPLOAD_MB}MB limit")
+            f.write(piece)
 
-    jobs[job_id] = {"status": "received", "filename": file.filename}
+    jobs[job_id] = {"status": "received", "filename": safe_name}
 
     background_tasks.add_task(process_document, job_id, save_path)
 
